@@ -1,0 +1,866 @@
+import { useState, useEffect, useMemo, useRef } from "react";
+import {
+  Search, Plus, Home, ChevronRight, Folder, FileText, Image, File,
+  Video, BookOpen, Pencil, Trash2, X, ExternalLink, Loader2,
+  AlertTriangle, GraduationCap, FolderOpen, Upload
+} from "lucide-react";
+
+// ---------- constants ----------
+
+const STORAGE_KEY = "pdpc-bahan-mengajar";
+
+const FOLDER_COLORS = [
+  { bg: "#D1608C", tint: "#FDEAF0" }, // rose pink
+  { bg: "#E3906B", tint: "#FBEEE6" }, // peach
+  { bg: "#6FA0D8", tint: "#EAF2FA" }, // sky blue
+  { bg: "#A87FC9", tint: "#F2EAF8" }, // lavender
+  { bg: "#D1A83A", tint: "#FBF3DF" }, // butter
+  { bg: "#7FAE8A", tint: "#EAF4EC" }, // mint
+];
+
+const FILE_TYPES = [
+  { value: "PDF", label: "PDF", icon: FileText, color: "#D1607A" },
+  { value: "Gambar", label: "Gambar", icon: Image, color: "#6FA0D8" },
+  { value: "Nota", label: "Nota", icon: BookOpen, color: "#D1A83A" },
+  { value: "Doc", label: "Dokumen", icon: File, color: "#7FAE8A" },
+  { value: "Video", label: "Pautan Video", icon: Video, color: "#A87FC9" },
+];
+
+const fileTypeMeta = (value) => FILE_TYPES.find((t) => t.value === value) || FILE_TYPES[3];
+
+const uid = () => `id_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+const seedData = () => [
+  {
+    id: uid(),
+    name: "Sejarah",
+    colorIndex: 0,
+    topics: [
+      {
+        id: uid(),
+        name: "Zaman Prasejarah",
+        files: [
+          { id: uid(), name: "Nota Zaman Paleolitik", type: "Nota", url: "https://drive.google.com" },
+          { id: uid(), name: "Slaid Peta Penempatan Awal", type: "PDF", url: "https://drive.google.com" },
+        ],
+      },
+      { id: uid(), name: "Kerajaan Awal Asia Tenggara", files: [] },
+    ],
+  },
+  {
+    id: uid(),
+    name: "Muzik Tingkatan 4",
+    colorIndex: 3,
+    topics: [
+      {
+        id: uid(),
+        name: "Unit 1: Elemen Muzik",
+        files: [
+          { id: uid(), name: "Video Pengenalan Rentak", type: "Video", url: "https://youtube.com" },
+        ],
+      },
+    ],
+  },
+];
+
+// ---------- small building blocks ----------
+
+function IconBadge({ icon: Icon, color, size = 18 }) {
+  return <Icon size={size} color={color} strokeWidth={2} />;
+}
+
+function Modal({ title, onClose, children, danger }) {
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-4"
+      style={{ background: "rgba(35,32,27,0.45)", animation: "pdpcFadeIn 0.15s ease-out" }}
+      onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}
+    >
+      <div
+        className="w-full max-w-md rounded-2xl bg-white shadow-2xl overflow-hidden"
+        style={{ animation: "pdpcPopIn 0.16s ease-out" }}
+      >
+        <div
+          className="flex items-center justify-between px-5 py-4 border-b"
+          style={{ borderColor: "#F6D9E6" }}
+        >
+          <h3
+            className="text-base font-semibold"
+            style={{ fontFamily: "'Fraunces', serif", color: danger ? "#C23B6B" : "#3D2436" }}
+          >
+            {title}
+          </h3>
+          <button
+            onClick={onClose}
+            className="p-1 rounded-full hover:bg-black/5 transition-colors"
+            aria-label="Tutup"
+          >
+            <X size={18} color="#9C7086" />
+          </button>
+        </div>
+        <div className="p-5">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+function TextField({ label, value, onChange, placeholder, autoFocus }) {
+  return (
+    <label className="block mb-4">
+      <span className="block text-sm font-medium mb-1.5" style={{ color: "#6B3B54" }}>{label}</span>
+      <input
+        autoFocus={autoFocus}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
+        className="w-full rounded-lg px-3 py-2 text-sm outline-none transition-shadow"
+        style={{ border: "1px solid #EFC3D6", background: "#FFF6FA" }}
+        onFocus={(e) => (e.target.style.boxShadow = "0 0 0 3px #D1608C33")}
+        onBlur={(e) => (e.target.style.boxShadow = "none")}
+      />
+    </label>
+  );
+}
+
+// ---------- main component ----------
+
+export default function PdPCMaterialsApp() {
+  const [subjects, setSubjects] = useState(null); // null = loading
+  const [saveState, setSaveState] = useState("idle"); // idle | saving | saved | error
+  const [storageBroken, setStorageBroken] = useState(false);
+  const [view, setView] = useState({ level: "home", subjectId: null, topicId: null });
+  const [query, setQuery] = useState("");
+  const [modal, setModal] = useState(null); // {type, ...payload}
+  const saveTimeout = useRef(null);
+
+  // load once
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await window.storage.get(STORAGE_KEY, false);
+        if (res && res.value) {
+          setSubjects(JSON.parse(res.value));
+        } else {
+          const seed = seedData();
+          setSubjects(seed);
+        }
+      } catch (err) {
+        setSubjects(seedData());
+      }
+    })();
+  }, []);
+
+  // persist on change (skip the initial load)
+  const firstRun = useRef(true);
+  useEffect(() => {
+    if (subjects === null) return;
+    if (firstRun.current) { firstRun.current = false; return; }
+    setSaveState("saving");
+    clearTimeout(saveTimeout.current);
+    saveTimeout.current = setTimeout(async () => {
+      try {
+        const result = await window.storage.set(STORAGE_KEY, JSON.stringify(subjects), false);
+        if (!result) throw new Error("no result");
+        setSaveState("saved");
+        setStorageBroken(false);
+      } catch (err) {
+        setSaveState("error");
+        setStorageBroken(true);
+      }
+    }, 350);
+  }, [subjects]);
+
+  const currentSubject = useMemo(
+    () => subjects?.find((s) => s.id === view.subjectId) || null,
+    [subjects, view.subjectId]
+  );
+  const currentTopic = useMemo(
+    () => currentSubject?.topics.find((t) => t.id === view.topicId) || null,
+    [currentSubject, view.topicId]
+  );
+
+  const goHome = () => { setView({ level: "home", subjectId: null, topicId: null }); setQuery(""); };
+  const goSubject = (subjectId) => { setView({ level: "subject", subjectId, topicId: null }); setQuery(""); };
+  const goTopic = (subjectId, topicId) => { setView({ level: "topic", subjectId, topicId }); setQuery(""); };
+
+  // ---------- mutations ----------
+
+  const addSubject = (name) => {
+    const colorIndex = (subjects?.length || 0) % FOLDER_COLORS.length;
+    setSubjects((prev) => [...prev, { id: uid(), name, colorIndex, topics: [] }]);
+  };
+  const renameSubject = (id, name) => {
+    setSubjects((prev) => prev.map((s) => (s.id === id ? { ...s, name } : s)));
+  };
+  const deleteSubject = (id) => {
+    setSubjects((prev) => prev.filter((s) => s.id !== id));
+    if (view.subjectId === id) goHome();
+  };
+
+  const addTopic = (subjectId, name) => {
+    setSubjects((prev) =>
+      prev.map((s) => (s.id === subjectId ? { ...s, topics: [...s.topics, { id: uid(), name, files: [] }] } : s))
+    );
+  };
+  const renameTopic = (subjectId, topicId, name) => {
+    setSubjects((prev) =>
+      prev.map((s) =>
+        s.id === subjectId
+          ? { ...s, topics: s.topics.map((t) => (t.id === topicId ? { ...t, name } : t)) }
+          : s
+      )
+    );
+  };
+  const deleteTopic = (subjectId, topicId) => {
+    setSubjects((prev) =>
+      prev.map((s) => (s.id === subjectId ? { ...s, topics: s.topics.filter((t) => t.id !== topicId) } : s))
+    );
+    if (view.topicId === topicId) goSubject(subjectId);
+  };
+
+  const addFile = (subjectId, topicId, file) => {
+    setSubjects((prev) =>
+      prev.map((s) =>
+        s.id === subjectId
+          ? {
+              ...s,
+              topics: s.topics.map((t) =>
+                t.id === topicId ? { ...t, files: [...t.files, { id: uid(), ...file }] } : t
+              ),
+            }
+          : s
+      )
+    );
+  };
+  const deleteFile = (subjectId, topicId, fileId) => {
+    setSubjects((prev) =>
+      prev.map((s) =>
+        s.id === subjectId
+          ? {
+              ...s,
+              topics: s.topics.map((t) =>
+                t.id === topicId ? { ...t, files: t.files.filter((f) => f.id !== fileId) } : t
+              ),
+            }
+          : s
+      )
+    );
+  };
+
+  // ---------- search ----------
+
+  const searchResults = useMemo(() => {
+    if (!query.trim() || !subjects) return null;
+    const q = query.trim().toLowerCase();
+    const results = [];
+    subjects.forEach((s) => {
+      if (s.name.toLowerCase().includes(q)) {
+        results.push({ kind: "subject", subject: s, path: [s.name] });
+      }
+      s.topics.forEach((t) => {
+        if (t.name.toLowerCase().includes(q)) {
+          results.push({ kind: "topic", subject: s, topic: t, path: [s.name, t.name] });
+        }
+        t.files.forEach((f) => {
+          if (f.name.toLowerCase().includes(q)) {
+            results.push({ kind: "file", subject: s, topic: t, file: f, path: [s.name, t.name, f.name] });
+          }
+        });
+      });
+    });
+    return results;
+  }, [query, subjects]);
+
+  // ---------- render helpers ----------
+
+  const breadcrumb = () => {
+    const crumbs = [{ label: "Utama", onClick: goHome }];
+    if (currentSubject) crumbs.push({ label: currentSubject.name, onClick: () => goSubject(currentSubject.id) });
+    if (currentTopic) crumbs.push({ label: currentTopic.name, onClick: () => goTopic(currentSubject.id, currentTopic.id) });
+    return crumbs;
+  };
+
+  const openAddModal = () => {
+    if (view.level === "home") setModal({ type: "addSubject" });
+    else if (view.level === "subject") setModal({ type: "addTopic" });
+    else setModal({ type: "addFile" });
+  };
+
+  if (subjects === null) {
+    return (
+      <div className="min-h-screen flex items-center justify-center" style={{ background: "#FDF2F6" }}>
+        <div className="flex items-center gap-2 text-sm" style={{ color: "#9C7086" }}>
+          <Loader2 size={18} className="animate-spin" />
+          Memuatkan bahan mengajar…
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className="min-h-screen w-full"
+      style={{ background: "#FDF2F6", fontFamily: "'Inter', sans-serif", color: "#3D2436" }}
+    >
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=Inter:wght@400;500;600;700&display=swap');
+        @keyframes pdpcFadeIn { from { opacity: 0; } to { opacity: 1; } }
+        @keyframes pdpcPopIn { from { opacity: 0; transform: scale(0.96) translateY(4px); } to { opacity: 1; transform: scale(1) translateY(0); } }
+        .pdpc-card { transition: transform 0.12s ease, box-shadow 0.12s ease, border-color 0.12s ease; }
+        .pdpc-card:hover { transform: translateY(-2px); box-shadow: 0 8px 20px rgba(35,32,27,0.08); }
+        .pdpc-row:hover .pdpc-row-actions { opacity: 1; }
+        .pdpc-scrollbar::-webkit-scrollbar { width: 6px; }
+        .pdpc-scrollbar::-webkit-scrollbar-thumb { background: #EFC3D6; border-radius: 4px; }
+      `}</style>
+
+      {/* header */}
+      <header className="sticky top-0 z-30 backdrop-blur" style={{ background: "#FDF2F6EE", borderBottom: "1px solid #F6D9E6" }}>
+        <div className="max-w-6xl mx-auto px-4 sm:px-6 py-4 flex items-center gap-4 flex-wrap">
+          <div className="flex items-center gap-2 shrink-0">
+            <div className="w-9 h-9 rounded-xl flex items-center justify-center" style={{ background: "#D1608C" }}>
+              <GraduationCap size={20} color="#fff" />
+            </div>
+            <div>
+              <h1 className="text-lg leading-tight" style={{ fontFamily: "'Fraunces', serif", fontWeight: 600 }}>
+                Bahan Mengajar
+              </h1>
+              <p className="text-xs -mt-0.5" style={{ color: "#B9899E" }}>
+                {saveState === "saving" ? "Menyimpan…" : saveState === "error" ? "Gagal menyimpan" : "Tersimpan"}
+              </p>
+            </div>
+          </div>
+
+          <div className="relative flex-1 min-w-[180px] max-w-md">
+            <Search size={16} color="#B9899E" className="absolute left-3 top-1/2 -translate-y-1/2" />
+            <input
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Cari subjek, topik atau fail…"
+              className="w-full rounded-full pl-9 pr-3 py-2 text-sm outline-none"
+              style={{ border: "1px solid #EFC3D6", background: "#FFFFFF" }}
+            />
+          </div>
+
+          <button
+            onClick={openAddModal}
+            className="ml-auto flex items-center gap-1.5 rounded-full px-4 py-2 text-sm font-medium text-white shrink-0 transition-opacity hover:opacity-90"
+            style={{ background: "#D1608C" }}
+          >
+            <Plus size={16} />
+            {view.level === "home" ? "Subjek Baharu" : view.level === "subject" ? "Topik Baharu" : "Tambah Bahan"}
+          </button>
+        </div>
+      </header>
+
+      <div className="max-w-6xl mx-auto px-4 sm:px-6 py-6 flex gap-6">
+        {/* sidebar */}
+        <aside className="hidden lg:block w-52 shrink-0">
+          <button
+            onClick={goHome}
+            className="w-full flex items-center gap-2 rounded-lg px-3 py-2 text-sm mb-1 transition-colors"
+            style={{
+              background: view.level === "home" ? "#FCE3EE" : "transparent",
+              fontWeight: view.level === "home" ? 600 : 400,
+            }}
+          >
+            <Home size={15} /> Semua Subjek
+          </button>
+          <div className="mt-3 pdpc-scrollbar overflow-y-auto max-h-[70vh]">
+            <p className="text-xs px-3 mb-1 uppercase tracking-wide" style={{ color: "#C79BAF", letterSpacing: "0.04em" }}>Subjek</p>
+            {subjects.map((s) => {
+              const c = FOLDER_COLORS[s.colorIndex % FOLDER_COLORS.length];
+              return (
+                <button
+                  key={s.id}
+                  onClick={() => goSubject(s.id)}
+                  className="w-full flex items-center gap-2 rounded-lg px-3 py-2 text-sm text-left truncate transition-colors"
+                  style={{
+                    background: view.subjectId === s.id ? c.tint : "transparent",
+                    fontWeight: view.subjectId === s.id ? 600 : 400,
+                  }}
+                  title={s.name}
+                >
+                  <span className="w-2 h-2 rounded-full shrink-0" style={{ background: c.bg }} />
+                  <span className="truncate">{s.name}</span>
+                </button>
+              );
+            })}
+          </div>
+        </aside>
+
+        {/* main */}
+        <main className="flex-1 min-w-0">
+          {storageBroken && (
+            <div className="mb-4 flex items-center gap-2 rounded-lg px-3 py-2 text-xs" style={{ background: "#FBE3ED", color: "#9C3A5A" }}>
+              <AlertTriangle size={14} /> Perubahan tidak dapat disimpan buat masa ini. Data akan hilang jika halaman ditutup.
+            </div>
+          )}
+
+          {/* breadcrumb */}
+          {!query && (
+            <nav className="flex items-center flex-wrap gap-1 text-sm mb-5" style={{ color: "#9C7086" }}>
+              {breadcrumb().map((c, i, arr) => (
+                <span key={i} className="flex items-center gap-1">
+                  <button
+                    onClick={c.onClick}
+                    className="hover:underline"
+                    style={{ color: i === arr.length - 1 ? "#3D2436" : "#9C7086", fontWeight: i === arr.length - 1 ? 600 : 400 }}
+                  >
+                    {c.label}
+                  </button>
+                  {i < arr.length - 1 && <ChevronRight size={14} />}
+                </span>
+              ))}
+            </nav>
+          )}
+
+          {query ? (
+            <SearchResults results={searchResults} query={query} onOpenSubject={goSubject} onOpenTopic={goTopic} />
+          ) : view.level === "home" ? (
+            <SubjectGrid
+              subjects={subjects}
+              onOpen={goSubject}
+              onEdit={(s) => setModal({ type: "editSubject", subject: s })}
+              onDelete={(s) => setModal({ type: "deleteSubject", subject: s })}
+            />
+          ) : view.level === "subject" ? (
+            <TopicGrid
+              subject={currentSubject}
+              onOpen={(t) => goTopic(currentSubject.id, t.id)}
+              onEdit={(t) => setModal({ type: "editTopic", topic: t })}
+              onDelete={(t) => setModal({ type: "deleteTopic", topic: t })}
+            />
+          ) : (
+            <FileList
+              topic={currentTopic}
+              onDelete={(f) => setModal({ type: "deleteFile", file: f })}
+            />
+          )}
+        </main>
+      </div>
+
+      {/* ---------- modals ---------- */}
+
+      {modal?.type === "addSubject" && (
+        <FolderFormModal
+          title="Subjek Baharu"
+          fieldLabel="Nama subjek"
+          placeholder="Contoh: PSV Tingkatan 5"
+          onClose={() => setModal(null)}
+          onSubmit={(name) => { addSubject(name); setModal(null); }}
+        />
+      )}
+      {modal?.type === "editSubject" && (
+        <FolderFormModal
+          title="Tukar Nama Subjek"
+          fieldLabel="Nama subjek"
+          initialValue={modal.subject.name}
+          onClose={() => setModal(null)}
+          onSubmit={(name) => { renameSubject(modal.subject.id, name); setModal(null); }}
+        />
+      )}
+      {modal?.type === "deleteSubject" && (
+        <ConfirmModal
+          title="Padam Subjek?"
+          message={`"${modal.subject.name}" dan semua topik serta fail di dalamnya akan dipadam. Tindakan ini tidak boleh diundur.`}
+          onCancel={() => setModal(null)}
+          onConfirm={() => { deleteSubject(modal.subject.id); setModal(null); }}
+        />
+      )}
+
+      {modal?.type === "addTopic" && (
+        <FolderFormModal
+          title="Topik Baharu"
+          fieldLabel="Nama topik / unit"
+          placeholder="Contoh: Unit 1: Pengenalan"
+          onClose={() => setModal(null)}
+          onSubmit={(name) => { addTopic(currentSubject.id, name); setModal(null); }}
+        />
+      )}
+      {modal?.type === "editTopic" && (
+        <FolderFormModal
+          title="Tukar Nama Topik"
+          fieldLabel="Nama topik / unit"
+          initialValue={modal.topic.name}
+          onClose={() => setModal(null)}
+          onSubmit={(name) => { renameTopic(currentSubject.id, modal.topic.id, name); setModal(null); }}
+        />
+      )}
+      {modal?.type === "deleteTopic" && (
+        <ConfirmModal
+          title="Padam Topik?"
+          message={`"${modal.topic.name}" dan semua fail di dalamnya akan dipadam. Tindakan ini tidak boleh diundur.`}
+          onCancel={() => setModal(null)}
+          onConfirm={() => { deleteTopic(currentSubject.id, modal.topic.id); setModal(null); }}
+        />
+      )}
+
+      {modal?.type === "addFile" && (
+        <FileFormModal
+          onClose={() => setModal(null)}
+          onSubmit={(file) => { addFile(currentSubject.id, currentTopic.id, file); setModal(null); }}
+        />
+      )}
+      {modal?.type === "deleteFile" && (
+        <ConfirmModal
+          title="Padam Fail?"
+          message={`"${modal.file.name}" akan dipadam daripada topik ini.`}
+          onCancel={() => setModal(null)}
+          onConfirm={() => { deleteFile(currentSubject.id, currentTopic.id, modal.file.id); setModal(null); }}
+        />
+      )}
+    </div>
+  );
+}
+
+// ---------- views ----------
+
+function SubjectGrid({ subjects, onOpen, onEdit, onDelete }) {
+  if (subjects.length === 0) {
+    return <EmptyState text="Belum ada subjek. Tambah subjek pertama untuk mula menyusun bahan mengajar." />;
+  }
+  return (
+    <div className="grid gap-4" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))" }}>
+      {subjects.map((s) => {
+        const c = FOLDER_COLORS[s.colorIndex % FOLDER_COLORS.length];
+        const fileCount = s.topics.reduce((sum, t) => sum + t.files.length, 0);
+        return (
+          <div
+            key={s.id}
+            className="pdpc-card group relative rounded-2xl p-4 cursor-pointer bg-white"
+            style={{ border: "1px solid #F6D9E6" }}
+            onClick={() => onOpen(s.id)}
+          >
+            <div className="w-11 h-11 rounded-xl flex items-center justify-center mb-3" style={{ background: c.tint }}>
+              <Folder size={22} color={c.bg} strokeWidth={2} />
+            </div>
+            <h3 className="text-sm font-semibold mb-1 truncate" title={s.name}>{s.name}</h3>
+            <p className="text-xs" style={{ color: "#B9899E" }}>
+              {s.topics.length} topik &middot; {fileCount} fail
+            </p>
+            <RowActions onEdit={() => onEdit(s)} onDelete={() => onDelete(s)} />
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function TopicGrid({ subject, onOpen, onEdit, onDelete }) {
+  if (subject.topics.length === 0) {
+    return <EmptyState text={`Belum ada topik dalam "${subject.name}". Tambah topik untuk mula memuat naik bahan.`} />;
+  }
+  const c = FOLDER_COLORS[subject.colorIndex % FOLDER_COLORS.length];
+  return (
+    <div className="grid gap-4" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))" }}>
+      {subject.topics.map((t) => (
+        <div
+          key={t.id}
+          className="pdpc-card group relative rounded-2xl p-4 cursor-pointer bg-white"
+          style={{ border: "1px solid #F6D9E6" }}
+          onClick={() => onOpen(t)}
+        >
+          <div className="w-11 h-11 rounded-xl flex items-center justify-center mb-3" style={{ background: c.tint }}>
+            <FolderOpen size={22} color={c.bg} strokeWidth={2} />
+          </div>
+          <h3 className="text-sm font-semibold mb-1 truncate" title={t.name}>{t.name}</h3>
+          <p className="text-xs" style={{ color: "#B9899E" }}>{t.files.length} fail</p>
+          <RowActions onEdit={() => onEdit(t)} onDelete={() => onDelete(t)} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function FileList({ topic, onDelete }) {
+  if (topic.files.length === 0) {
+    return <EmptyState text={`Belum ada fail dalam "${topic.name}". Tambah bahan pertama anda.`} />;
+  }
+  return (
+    <div className="rounded-2xl bg-white overflow-hidden" style={{ border: "1px solid #F6D9E6" }}>
+      {topic.files.map((f, i) => {
+        const meta = fileTypeMeta(f.type);
+        const Icon = meta.icon;
+        const isLocal = typeof f.url === "string" && f.url.startsWith("data:");
+        return (
+          <div
+            key={f.id}
+            className="pdpc-row flex items-center gap-3 px-4 py-3"
+            style={{ borderTop: i === 0 ? "none" : "1px solid #F8E3EC" }}
+          >
+            <div className="w-9 h-9 rounded-lg flex items-center justify-center shrink-0" style={{ background: meta.color + "1A" }}>
+              <Icon size={17} color={meta.color} />
+            </div>
+            <div className="min-w-0 flex-1">
+              <p className="text-sm font-medium truncate">{f.name}</p>
+              <p className="text-xs" style={{ color: "#B9899E" }}>{meta.label} · {isLocal ? "Fail Peranti" : "Pautan"}</p>
+            </div>
+            <div className="pdpc-row-actions flex items-center gap-1 opacity-0 sm:opacity-0 transition-opacity" style={{ opacity: undefined }}>
+              <a
+                href={f.url || "#"}
+                target="_blank"
+                rel="noreferrer"
+                download={isLocal ? f.name : undefined}
+                className="p-2 rounded-lg hover:bg-black/5"
+                title="Pratonton / Muat turun"
+                onClick={(e) => { if (!f.url) e.preventDefault(); }}
+              >
+                <ExternalLink size={16} color="#9C7086" />
+              </a>
+              <button onClick={() => onDelete(f)} className="p-2 rounded-lg hover:bg-black/5" title="Padam">
+                <Trash2 size={16} color="#C23B6B" />
+              </button>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function SearchResults({ results, query, onOpenSubject, onOpenTopic }) {
+  if (!results || results.length === 0) {
+    return <EmptyState text={`Tiada hasil untuk "${query}". Cuba kata kunci lain.`} />;
+  }
+  return (
+    <div className="rounded-2xl bg-white overflow-hidden" style={{ border: "1px solid #F6D9E6" }}>
+      {results.map((r, i) => {
+        const isFile = r.kind === "file";
+        const meta = isFile ? fileTypeMeta(r.file.type) : null;
+        const Icon = isFile ? meta.icon : r.kind === "topic" ? FolderOpen : Folder;
+        const color = isFile ? meta.color : FOLDER_COLORS[r.subject.colorIndex % FOLDER_COLORS.length].bg;
+        const label = isFile ? r.file.name : r.kind === "topic" ? r.topic.name : r.subject.name;
+
+        const handleClick = () => {
+          if (r.kind === "subject") onOpenSubject(r.subject.id);
+          else if (r.kind === "topic") onOpenTopic(r.subject.id, r.topic.id);
+          else onOpenTopic(r.subject.id, r.topic.id);
+        };
+
+        return (
+          <button
+            key={i}
+            onClick={handleClick}
+            className="w-full flex items-center gap-3 px-4 py-3 text-left hover:bg-black/[0.02]"
+            style={{ borderTop: i === 0 ? "none" : "1px solid #F8E3EC" }}
+          >
+            <div className="w-9 h-9 rounded-lg flex items-center justify-center shrink-0" style={{ background: color + "1A" }}>
+              <Icon size={17} color={color} />
+            </div>
+            <div className="min-w-0 flex-1">
+              <p className="text-sm font-medium truncate">{label}</p>
+              <p className="text-xs truncate" style={{ color: "#B9899E" }}>{r.path.join(" › ")}</p>
+            </div>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function EmptyState({ text }) {
+  return (
+    <div className="rounded-2xl border border-dashed flex flex-col items-center justify-center text-center px-6 py-16" style={{ borderColor: "#EFC3D6" }}>
+      <div className="w-12 h-12 rounded-full flex items-center justify-center mb-3" style={{ background: "#FCE3EE" }}>
+        <Folder size={22} color="#B9899E" />
+      </div>
+      <p className="text-sm max-w-xs" style={{ color: "#9C7086" }}>{text}</p>
+    </div>
+  );
+}
+
+function RowActions({ onEdit, onDelete }) {
+  return (
+    <div className="absolute top-3 right-3 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+      <button
+        onClick={(e) => { e.stopPropagation(); onEdit(); }}
+        className="p-1.5 rounded-lg bg-white/90 hover:bg-white shadow-sm"
+        title="Edit"
+      >
+        <Pencil size={14} color="#9C7086" />
+      </button>
+      <button
+        onClick={(e) => { e.stopPropagation(); onDelete(); }}
+        className="p-1.5 rounded-lg bg-white/90 hover:bg-white shadow-sm"
+        title="Padam"
+      >
+        <Trash2 size={14} color="#C23B6B" />
+      </button>
+    </div>
+  );
+}
+
+// ---------- form modals ----------
+
+function FolderFormModal({ title, fieldLabel, placeholder, initialValue = "", onClose, onSubmit }) {
+  const [name, setName] = useState(initialValue);
+  const canSubmit = name.trim().length > 0;
+  return (
+    <Modal title={title} onClose={onClose}>
+      <TextField label={fieldLabel} value={name} onChange={setName} placeholder={placeholder} autoFocus />
+      <div className="flex justify-end gap-2 mt-2">
+        <button onClick={onClose} className="px-4 py-2 rounded-lg text-sm font-medium" style={{ color: "#9C7086" }}>
+          Batal
+        </button>
+        <button
+          disabled={!canSubmit}
+          onClick={() => canSubmit && onSubmit(name.trim())}
+          className="px-4 py-2 rounded-lg text-sm font-medium text-white transition-opacity"
+          style={{ background: "#D1608C", opacity: canSubmit ? 1 : 0.5 }}
+        >
+          Simpan
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
+function FileFormModal({ onClose, onSubmit }) {
+  const [mode, setMode] = useState("upload"); // "upload" | "link"
+  const [name, setName] = useState("");
+  const [type, setType] = useState(FILE_TYPES[0].value);
+  const [url, setUrl] = useState("");
+  const [fileInfo, setFileInfo] = useState(null); // { name, size }
+  const [fileError, setFileError] = useState("");
+  const canSubmit = name.trim().length > 0 && (mode === "link" || !!url);
+
+  const handleFileChange = (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    setFileError("");
+    if (file.size > 4 * 1024 * 1024) {
+      setFileError("Fail ini melebihi 4MB — mungkin gagal disimpan pada peranti ini.");
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      setUrl(reader.result);
+      setFileInfo({ name: file.name, size: file.size });
+      setName((prev) => (prev.trim() ? prev : file.name.replace(/\.[^/.]+$/, "")));
+      if (file.type.startsWith("image/")) setType("Gambar");
+      else if (file.type === "application/pdf") setType("PDF");
+      else if (file.type.startsWith("video/")) setType("Video");
+      else setType("Doc");
+    };
+    reader.onerror = () => setFileError("Gagal membaca fail ini.");
+    reader.readAsDataURL(file);
+  };
+
+  const switchMode = (next) => {
+    setMode(next);
+    setUrl("");
+    setFileInfo(null);
+    setFileError("");
+  };
+
+  return (
+    <Modal title="Tambah Bahan" onClose={onClose}>
+      <div className="flex gap-2 mb-4">
+        <button
+          type="button"
+          onClick={() => switchMode("upload")}
+          className="flex-1 flex items-center justify-center gap-1.5 rounded-lg px-3 py-2 text-sm font-medium transition-colors"
+          style={{ background: mode === "upload" ? "#D1608C" : "#FBEEF3", color: mode === "upload" ? "#fff" : "#9C7086" }}
+        >
+          <Upload size={15} /> Fail dari Peranti
+        </button>
+        <button
+          type="button"
+          onClick={() => switchMode("link")}
+          className="flex-1 flex items-center justify-center gap-1.5 rounded-lg px-3 py-2 text-sm font-medium transition-colors"
+          style={{ background: mode === "link" ? "#D1608C" : "#FBEEF3", color: mode === "link" ? "#fff" : "#9C7086" }}
+        >
+          <ExternalLink size={15} /> Pautan URL
+        </button>
+      </div>
+
+      {mode === "upload" ? (
+        <label className="block mb-4">
+          <span className="block text-sm font-medium mb-1.5" style={{ color: "#6B3B54" }}>Pilih fail</span>
+          <div
+            className="relative overflow-hidden flex items-center gap-2 rounded-lg px-3 py-3 text-sm cursor-pointer"
+            style={{ border: "1.5px dashed #EFC3D6", background: "#FFF6FA" }}
+          >
+            <Upload size={16} color="#D1608C" />
+            <span className="truncate" style={{ color: fileInfo ? "#3D2436" : "#9C7086" }}>
+              {fileInfo ? fileInfo.name : "Ketik untuk pilih dari galeri, fail, atau kamera"}
+            </span>
+            <input
+              type="file"
+              accept="application/pdf,image/*,video/*,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.txt"
+              onChange={handleFileChange}
+              className="absolute inset-0 opacity-0 cursor-pointer"
+              style={{ width: "100%", height: "100%" }}
+            />
+          </div>
+          {fileInfo && (
+            <p className="text-xs mt-1" style={{ color: "#9C7086" }}>{(fileInfo.size / 1024).toFixed(0)} KB dipilih</p>
+          )}
+          {fileError && <p className="text-xs mt-1" style={{ color: "#C23B6B" }}>{fileError}</p>}
+        </label>
+      ) : (
+        <TextField label="Pautan URL" value={url} onChange={setUrl} placeholder="https://drive.google.com/…" />
+      )}
+
+      <TextField label="Nama fail" value={name} onChange={setName} placeholder="Contoh: Nota Bab 1" />
+
+      <label className="block mb-4">
+        <span className="block text-sm font-medium mb-1.5" style={{ color: "#6B3B54" }}>Jenis fail</span>
+        <div className="flex flex-wrap gap-2">
+          {FILE_TYPES.map((t) => {
+            const Icon = t.icon;
+            const active = type === t.value;
+            return (
+              <button
+                key={t.value}
+                onClick={() => setType(t.value)}
+                type="button"
+                className="flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-medium transition-colors"
+                style={{
+                  background: active ? t.color + "1A" : "#FBEEF3",
+                  color: active ? t.color : "#9C7086",
+                  border: active ? `1px solid ${t.color}55` : "1px solid transparent",
+                }}
+              >
+                <Icon size={13} /> {t.label}
+              </button>
+            );
+          })}
+        </div>
+      </label>
+
+      <div className="flex justify-end gap-2 mt-2">
+        <button onClick={onClose} className="px-4 py-2 rounded-lg text-sm font-medium" style={{ color: "#9C7086" }}>
+          Batal
+        </button>
+        <button
+          disabled={!canSubmit}
+          onClick={() => canSubmit && onSubmit({ name: name.trim(), type, url })}
+          className="px-4 py-2 rounded-lg text-sm font-medium text-white transition-opacity"
+          style={{ background: "#D1608C", opacity: canSubmit ? 1 : 0.5 }}
+        >
+          Simpan
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
+function ConfirmModal({ title, message, onCancel, onConfirm }) {
+  return (
+    <Modal title={title} onClose={onCancel} danger>
+      <p className="text-sm mb-5" style={{ color: "#6B3B54" }}>{message}</p>
+      <div className="flex justify-end gap-2">
+        <button onClick={onCancel} className="px-4 py-2 rounded-lg text-sm font-medium" style={{ color: "#9C7086" }}>
+          Batal
+        </button>
+        <button
+          onClick={onConfirm}
+          className="px-4 py-2 rounded-lg text-sm font-medium text-white"
+          style={{ background: "#C23B6B" }}
+        >
+          Padam
+        </button>
+      </div>
+    </Modal>
+  );
+}
